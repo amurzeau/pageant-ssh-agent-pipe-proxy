@@ -19,8 +19,10 @@ project(pageant-ssh-agent-pipe-proxy VERSION "${GIT_VERSION_TRIMMED}" LANGUAGES 
 set(CMAKE_CXX_STANDARD 17)
 
 add_executable(pageant-pipe-proxy pageant-pipe-proxy.cpp)
+target_compile_definitions(pageant-pipe-proxy PUBLIC _UNICODE UNICODE)
 
 add_executable(ssh-agent-pipe-proxy pipe-ssh-agent-unix.cpp)
+target_compile_definitions(ssh-agent-pipe-proxy PUBLIC _UNICODE UNICODE)
 target_link_libraries(ssh-agent-pipe-proxy PRIVATE ws2_32.lib)
 
 install(TARGETS pageant-pipe-proxy ssh-agent-pipe-proxy)

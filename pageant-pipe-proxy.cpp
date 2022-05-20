@@ -220,9 +220,9 @@ DWORD WINAPI InstanceThread(LPVOID lpvParam)
 }
 
 VOID GetAnswerToRequest(void* pchRequest, DWORD pchRequestBytes, void* pchReply, DWORD* pchReplyBytes) {
-	char mapName[128];
-	sprintf_s(mapName, sizeof(mapName), "PageantRequest%08lx", GetCurrentThreadId());
-	mapName[sizeof(mapName) - 1] = 0;
+	TCHAR mapName[128];
+	_stprintf_s(mapName, sizeof(mapName), _TEXT("PageantRequest%08lx"), GetCurrentThreadId());
+	mapName[_countof(mapName) - 1] = 0;
 
 	*pchReplyBytes = 0;
 
@@ -232,7 +232,7 @@ VOID GetAnswerToRequest(void* pchRequest, DWORD pchRequestBytes, void* pchReply,
 	}
 	printf("\n");
 
-	HWND pageantHwnd = FindWindow("Pageant", "Pageant");
+	HWND pageantHwnd = FindWindow(TEXT("Pageant"), TEXT("Pageant"));
 	if(pageantHwnd == INVALID_HANDLE_VALUE) {
 		printf("Failed to find Pageant window: %lu\n", GetLastError());
 	}
@@ -249,7 +249,7 @@ VOID GetAnswerToRequest(void* pchRequest, DWORD pchRequestBytes, void* pchReply,
 
 	COPYDATASTRUCT cds;
 	cds.dwData = AGENT_COPYDATA_ID;
-	cds.cbData = (DWORD) (strlen(mapName) + 1);
+	cds.cbData = (DWORD) (_tcslen(mapName) + 1);
 	cds.lpData = mapName;
 	LRESULT result = SendMessage(pageantHwnd, WM_COPYDATA, 0, (LPARAM) &cds);
 	if(result == FALSE) {
