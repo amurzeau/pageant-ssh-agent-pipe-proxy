@@ -159,12 +159,13 @@ DWORD WINAPI InstanceThread(LPVOID lpvParam)
 	// Loop until done reading
 	while(1) {
 		int byteRead = 0;
+		int remainingBytes = AGENT_MAX_MSGLEN;
 		do {
 			// Read client requests from the pipe. This simplistic code only allows messages
 			// up to AGENT_MAX_MSGLEN characters in length.
 			fSuccess = ReadFile(hPipe,                  // handle to pipe
 			                    pchRequest + byteRead,  // buffer to receive data
-			                    AGENT_MAX_MSGLEN,       // size of buffer
+			                    remainingBytes,         // size of buffer
 			                    &cbBytesRead,           // number of bytes read
 			                    NULL);                  // not overlapped I/O
 
@@ -177,8 +178,11 @@ DWORD WINAPI InstanceThread(LPVOID lpvParam)
 				break;
 			} else {
 				byteRead += cbBytesRead;
+				if(byteRead > 4) {
+					remainingBytes = readu32(pchRequest) + 4 - byteRead;
+				}
 			}
-		} while(byteRead < 4 || byteRead < readu32(pchRequest) + 4);
+		} while(remainingBytes > 0);
 
 		if(!fSuccess) {
 			break;
@@ -220,17 +224,26 @@ VOID GetAnswerToRequest(void* pchRequest, DWORD pchRequestBytes, void* pchReply,
 	sprintf_s(mapName, sizeof(mapName), "PageantRequest%08lx", GetCurrentThreadId());
 	mapName[sizeof(mapName) - 1] = 0;
 
+	*pchReplyBytes = 0;
+
 	printf("Sending %lu bytes to pageant\n", pchRequestBytes);
 	for(DWORD i = 0; i < pchRequestBytes; i++) {
-		printf("%02x ", ((const char*) pchRequest)[i]);
+		printf("%02x ", ((const uint8_t*) pchRequest)[i]);
 	}
 	printf("\n");
 
-	HWND pageantHwnd = FindWindow(NULL, "Pageant");
+	HWND pageantHwnd = FindWindow("Pageant", "Pageant");
+	if(pageantHwnd == INVALID_HANDLE_VALUE) {
+		printf("Failed to find Pageant window: %lu\n", GetLastError());
+	}
 
 	HANDLE fileMap = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, AGENT_MAX_MSGLEN, mapName);
+	if(fileMap == INVALID_HANDLE_VALUE) {
+		printf("Failed to create file mapping: %lu\n", GetLastError());
+		return;
+	}
 
-	uint8_t* sharedMemory = (uint8_t*) MapViewOfFile(fileMap, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, 0);
+	uint8_t* sharedMemory = (uint8_t*) MapViewOfFile(fileMap, FILE_MAP_WRITE, 0, 0, 0);
 
 	memcpy_s(sharedMemory, AGENT_MAX_MSGLEN, pchRequest, pchRequestBytes);
 
@@ -238,7 +251,10 @@ VOID GetAnswerToRequest(void* pchRequest, DWORD pchRequestBytes, void* pchReply,
 	cds.dwData = AGENT_COPYDATA_ID;
 	cds.cbData = (DWORD) (strlen(mapName) + 1);
 	cds.lpData = mapName;
-	SendMessage(pageantHwnd, WM_COPYDATA, 0, (LPARAM) &cds);
+	LRESULT result = SendMessage(pageantHwnd, WM_COPYDATA, 0, (LPARAM) &cds);
+	if(result == FALSE) {
+		printf("SendMessage failed: %lu\n", GetLastError());
+	}
 
 	DWORD replyLen =
 	    (sharedMemory[0] << 24) | (sharedMemory[1] << 16) | (sharedMemory[2] << 8) | (sharedMemory[3] << 0);
@@ -255,7 +271,7 @@ VOID GetAnswerToRequest(void* pchRequest, DWORD pchRequestBytes, void* pchReply,
 
 	printf("Read %lu bytes from pageant\n", replyLen);
 	for(DWORD i = 0; i < replyLen; i++) {
-		printf("%02x ", ((const char*) pchReply)[i]);
+		printf("%02x ", ((const uint8_t*) pchReply)[i]);
 	}
 	printf("\n");
 
