@@ -7,8 +7,30 @@
 #include <tchar.h>
 #include <windows.h>
 
+#include <memory>
+#include <vector>
+
 #define AGENT_MAX_MSGLEN 2621440
 #define AGENT_COPYDATA_ID 0x804e50ba
+
+template<class F> class final_act {
+public:
+	explicit final_act(F f) noexcept : f_(std::move(f)), invoke_(true) {}
+
+	final_act(final_act&& other) noexcept : f_(std::move(other.f_)), invoke_(other.invoke_) { other.invoke_ = false; }
+
+	final_act(const final_act&) = delete;
+	final_act& operator=(const final_act&) = delete;
+
+	~final_act() noexcept {
+		if(invoke_)
+			f_();
+	}
+
+private:
+	F f_;
+	bool invoke_;
+};
 
 struct thread_data {
 	HANDLE hPipe;
@@ -29,7 +51,6 @@ int _tmain(void) {
 	HANDLE hPipe = INVALID_HANDLE_VALUE, hThread = NULL;
 	LPCTSTR pipeRequiredPrefix = TEXT("\\\\.");
 	LPCTSTR lpszPipename = TEXT("\\\\.\\pipe\\openssh-ssh-agent");
-	HANDLE hHeap = GetProcessHeap();
 
 	if(__argc == 2) {
 		if(_tcsncmp(__targv[1], pipeRequiredPrefix, _tcslen(pipeRequiredPrefix)) != 0) {
@@ -83,22 +104,11 @@ int _tmain(void) {
 
 		printf("Client connected, creating a processing thread.\n");
 
-		SOCKET sock = connect_unix_socket();
-		if(sock == INVALID_SOCKET) {
-			printf("Error: cannot connect to upstream ssh-agent\n");
-			CloseHandle(hPipe);
-			continue;
-		}
-
-		struct thread_data* data = (struct thread_data*) HeapAlloc(hHeap, 0, sizeof(*data));
-		data->hPipe = hPipe;
-		data->sock = sock;
-
 		// Create a read thread for this client.
 		hThread = CreateThread(NULL,            // no security attribute
 		                       0,               // default stack size
 		                       InstanceThread,  // thread proc
-		                       (LPVOID) data,   // thread parameter
+		                       (LPVOID) hPipe,  // thread parameter
 		                       0,               // not suspended
 		                       &dwThreadId);    // returns thread ID
 
@@ -126,6 +136,33 @@ uint32_t readu32(const void* buffer) {
 	return (buffer_char[0] << 24) | (buffer_char[1] << 16) | (buffer_char[2] << 8) | (buffer_char[3] << 0);
 }
 
+template<typename T> int32_t readAgentMessage(T readFunction, void* buffer, int32_t maxSize) {
+	uint8_t* buffer_char = (uint8_t*) buffer;
+
+	int32_t byteRead = 0;
+	do {
+		int32_t result = readFunction(buffer_char + byteRead, maxSize - byteRead);
+		if(result < 0) {
+			printf("Failed to read agent message: %d\n", result);
+			return result;
+		} else if(result == 0) {
+			// EOF
+			return 0;
+		}
+
+		printf("Read %d + %d bytes from ssh-agent\n", result, byteRead);
+		for(int32_t i = 0; i < result; i++) {
+			printf("%02x ", *(buffer_char + byteRead + i));
+		}
+		printf("\n");
+
+		byteRead += result;
+
+	} while(byteRead < 4 || byteRead < (int32_t) readu32(buffer_char) + 4);
+
+	return byteRead;
+}
+
 DWORD WINAPI InstanceThread(LPVOID lpvData)
 // This routine is a thread processing function to read from and reply to a client
 // via the open pipe connection passed from the main loop. Note this allows
@@ -133,152 +170,112 @@ DWORD WINAPI InstanceThread(LPVOID lpvData)
 // of this procedure to run concurrently, depending on the number of incoming
 // client connections.
 {
-	struct thread_data* data = (struct thread_data*) lpvData;
-	HANDLE hHeap = GetProcessHeap();
-	char* pchRequest = (char*) HeapAlloc(hHeap, 0, AGENT_MAX_MSGLEN);
-	char* pchReply = (char*) HeapAlloc(hHeap, 0, AGENT_MAX_MSGLEN);
+	std::vector<char> pchRequest(AGENT_MAX_MSGLEN);
+	std::vector<char> pchReply(AGENT_MAX_MSGLEN);
 
-	DWORD cbBytesRead = 0, cbWritten = 0;
+	DWORD cbWritten = 0;
 	BOOL fSuccess = FALSE;
-	HANDLE hPipe = NULL;
-	SOCKET sock;
+	HANDLE hPipe = (HANDLE) lpvData;
 	int result;
+
+	final_act closePipe([&hPipe]() {
+		if(hPipe) {
+			FlushFileBuffers(hPipe);
+			DisconnectNamedPipe(hPipe);
+			CloseHandle(hPipe);
+		}
+	});
 
 	// Do some extra error checking since the app will keep running even if this
 	// thread fails.
 
-	if(data == NULL) {
+	if(hPipe == NULL) {
 		printf("\nERROR - Pipe Server Failure:\n");
 		printf("   InstanceThread got an unexpected NULL value in lpvParam.\n");
 		printf("   InstanceThread exitting.\n");
-		if(pchReply != NULL)
-			HeapFree(hHeap, 0, pchReply);
-		if(pchRequest != NULL)
-			HeapFree(hHeap, 0, pchRequest);
 		return (DWORD) -1;
 	}
 
-	if(pchRequest == NULL) {
-		printf("\nERROR - Pipe Server Failure:\n");
-		printf("   InstanceThread got an unexpected NULL heap allocation.\n");
-		printf("   InstanceThread exitting.\n");
-		if(pchReply != NULL)
-			HeapFree(hHeap, 0, pchReply);
-		return (DWORD) -1;
+	SOCKET sock = connect_unix_socket();
+	if(sock == INVALID_SOCKET) {
+		printf("Error: cannot connect to upstream ssh-agent\n");
+		return (DWORD) -2;
 	}
-
-	if(pchReply == NULL) {
-		printf("\nERROR - Pipe Server Failure:\n");
-		printf("   InstanceThread got an unexpected NULL heap allocation.\n");
-		printf("   InstanceThread exitting.\n");
-		if(pchRequest != NULL)
-			HeapFree(hHeap, 0, pchRequest);
-		return (DWORD) -1;
-	}
+	final_act closeSock([&sock]() {
+		if(sock) {
+			closesocket(sock);
+		}
+	});
 
 	// Print verbose messages. In production code, this should be for debugging only.
 	printf("InstanceThread created, receiving and processing messages.\n");
 
-	// The thread's parameter is a handle to a pipe object instance.
-
-	hPipe = data->hPipe;
-	sock = data->sock;
-
-	HeapFree(hHeap, 0, data);
-
 	// Loop until done reading
 	while(1) {
-		// if(isReading) {
-		int byteRead = 0;
-		do {
-			// Read client requests from the pipe. This simplistic code only allows messages
-			// up to AGENT_MAX_MSGLEN characters in length.
-			fSuccess = ReadFile(hPipe,                  // handle to pipe
-			                    pchRequest + byteRead,  // buffer to receive data
-			                    AGENT_MAX_MSGLEN,       // size of buffer
-			                    &cbBytesRead,           // number of bytes read
-			                    NULL);                  // not overlapped I/O
+		int32_t byteRead = readAgentMessage(
+		    [hPipe](void* buffer, int32_t size) {
+			    DWORD cbBytesRead = 0;
+			    BOOL fSuccess = ReadFile(hPipe,         // handle to pipe
+			                             buffer,        // buffer to receive data
+			                             size,          // size of buffer
+			                             &cbBytesRead,  // number of bytes read
+			                             NULL);         // not overlapped I/O
 
-			if(!fSuccess || cbBytesRead == 0) {
-				if(GetLastError() == ERROR_BROKEN_PIPE) {
-					_tprintf(TEXT("InstanceThread: client disconnected.\n"));
-				} else {
-					_tprintf(TEXT("InstanceThread ReadFile failed, GLE=%lu.\n"), GetLastError());
-				}
-				break;
-			} else {
-				byteRead += cbBytesRead;
-			}
-		} while(byteRead < 4 || byteRead < readu32(pchRequest) + 4);
+			    if(fSuccess) {
+				    return (int32_t) cbBytesRead;
+			    } else {
+				    DWORD lastError = GetLastError();
+				    if(lastError == ERROR_BROKEN_PIPE)
+					    return 0;
+				    else
+					    return -(int32_t) lastError;
+			    }
+		    },
+		    &pchRequest[0],
+		    pchRequest.size());
 
-		if(!fSuccess) {
+		if(byteRead <= 0)
 			break;
-		}
 
-		printf("Sending %lu bytes to ssh-agent\n", byteRead);
-		for(DWORD i = 0; i < byteRead; i++) {
-			printf("%02x ", ((const char*) pchRequest)[i]);
+		printf("Sending %d bytes to ssh-agent\n", byteRead);
+		for(int i = 0; i < byteRead; i++) {
+			printf("%02x ", pchRequest[i]);
 		}
 		printf("\n");
-		result = send(sock, (const char*) pchRequest, byteRead, 0);
+		result = send(sock, &pchRequest[0], byteRead, 0);
 		if(result != (int) byteRead) {
 			printf("Failed to send query data to socket : %lu\n", GetLastError());
 			break;
 		}
-		// } else {
-		// Write to pipe
-		byteRead = 0;
-		do {
-			result = recv(sock, (char*) pchReply + byteRead, AGENT_MAX_MSGLEN, 0);
-			if(result < 0) {
-				printf("Failed to recv query data to socket : %lu\n", GetLastError());
-				break;
-			}
-			printf("Read %d + %d bytes from ssh-agent\n", result, byteRead);
-			for(int i = 0; i < result; i++) {
-				printf("%02x ", ((const char*) pchReply + byteRead)[i]);
-			}
-			printf("\n");
 
-			byteRead += result;
+		byteRead = readAgentMessage(
+		    [sock](void* buffer, int32_t size) {
+			    int result = recv(sock, (char*) buffer, size, 0);
+			    if(result < 0)
+				    return -(int32_t) GetLastError();
+			    else
+				    return result;
+		    },
+		    &pchReply[0],
+		    pchReply.size());
 
-		} while(byteRead < 4 || byteRead < readu32(pchReply) + 4);
-
-		if(result < 0) {
-			break;
-		}
-
-		if(byteRead == 0) {
+		if(byteRead <= 0) {
 			printf("ssh-agent connection closed\n");
 			break;
 		}
 
 		// Write the reply to the pipe.
-		fSuccess = WriteFile(hPipe,       // handle to pipe
-		                     pchReply,    // buffer to write from
-		                     byteRead,    // number of bytes to write
-		                     &cbWritten,  // number of bytes written
-		                     NULL);       // not overlapped I/O
+		fSuccess = WriteFile(hPipe,         // handle to pipe
+		                     &pchReply[0],  // buffer to write from
+		                     byteRead,      // number of bytes to write
+		                     &cbWritten,    // number of bytes written
+		                     NULL);         // not overlapped I/O
 
 		if(!fSuccess || cbWritten == 0) {
 			_tprintf(TEXT("InstanceThread WriteFile failed, GLE=%lu.\n"), GetLastError());
 			break;
 		}
-		//}
 	}
-
-	// Flush the pipe to allow the client to read the pipe's contents
-	// before disconnecting. Then disconnect the pipe, and close the
-	// handle to this pipe instance.
-
-	closesocket(sock);
-
-	FlushFileBuffers(hPipe);
-	DisconnectNamedPipe(hPipe);
-	CloseHandle(hPipe);
-
-	HeapFree(hHeap, 0, pchRequest);
-	HeapFree(hHeap, 0, pchReply);
 
 	printf("InstanceThread exiting.\n");
 	return 1;
