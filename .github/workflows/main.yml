@@ -35,7 +35,7 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
           if ($lastexitcode -ne 0) { exit $lastexitcode }
           
-          cmake --build build --target package --config RelWithDebInfo -- -j4
+          cmake --build build --target package --config RelWithDebInfo
           if ($lastexitcode -ne 0) { exit $lastexitcode }
 
       - name: Upload a Build Artifact
